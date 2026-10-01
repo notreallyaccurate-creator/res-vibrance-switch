@@ -1,0 +1,19 @@
+# Build output
+build/
+dist/
+dist-installer/
+dist-new/
+*.spec
+version_info.txt
+build.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Personal settings / runtime state
+config.json
+state.json
+*.tmp
