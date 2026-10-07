@@ -1,4 +1,4 @@
-"""Res & Vibrance Switch core: displays, resolution, colour, process watching and config.
+"""Res & Vibrance Switch core: displays, resolution, colour, process watching and config (Linux).
 
 Usage:
     python resvib.py run              watch for games and switch automatically
@@ -7,88 +7,207 @@ Usage:
     python resvib.py modes            list resolutions supported by the main display
 """
 
-import ctypes
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
-from ctypes import wintypes
 from pathlib import Path
 
-EXE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-APPDATA_DIR = Path(os.environ.get("APPDATA") or Path.home()) / "ResVibranceSwitch"
-# A config.json next to the exe means "portable mode"; otherwise settings live in %APPDATA%.
-DATA_DIR = EXE_DIR if (EXE_DIR / "config.json").exists() else APPDATA_DIR
+DATA_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ResVibranceSwitch"
 CONFIG_PATH = DATA_DIR / "config.json"
 STATE_PATH = DATA_DIR / "state.json"
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+def _run(*cmd, env=None):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                             env={**os.environ, **env} if env else None)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"{cmd[0]}: {e}") from e
+    if out.returncode:
+        raise RuntimeError(f"{cmd[0]} failed: {(out.stderr or out.stdout).strip()}")
+    return out.stdout
+
+
+_hypr_lua = None
+
+
+def hypr(lua, legacy):
+    """Run a Lua snippet on Hyprland's Lua config (0.56+), else the `hyprctl keyword` equivalent (legacy)."""
+    global _hypr_lua
+    if _hypr_lua is None:
+        try:
+            _hypr_lua = _run("hyprctl", "eval", "local _ = 1").strip() == "ok"
+        except RuntimeError:
+            _hypr_lua = False
+    out = (_run("hyprctl", "eval", lua) if _hypr_lua else _run("hyprctl", "keyword", *legacy)).strip()
+    if out != "ok":
+        raise RuntimeError(f"Hyprland: {out}")
+
+
+def lua_str(text):
+    return json.dumps(text)  # a JSON string is a valid Lua string literal for anything we pass
+
+
+def session():
+    """Which display backend this desktop needs: hyprland, kde, gnome, wlroots or x11."""
+    env = os.environ
+    desktop = env.get("XDG_CURRENT_DESKTOP", "").lower()
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if "kde" in desktop and shutil.which("kscreen-doctor"):
+        return "kde"
+    if env.get("WAYLAND_DISPLAY"):
+        if "gnome" in desktop:
+            return "gnome"
+        if shutil.which("wlr-randr"):
+            return "wlroots"
+        raise RuntimeError("Unsupported Wayland desktop - install wlr-randr (sway, river, niri, labwc...)")
+    if env.get("DISPLAY") and shutil.which("xrandr"):
+        return "x11"
+    raise RuntimeError("No supported display server found (need Hyprland, KDE, GNOME, wlr-randr or xrandr)")
+
+
+SESSION = session()
 
 
 # --------------------------------------------------------------------------
-# Displays
+# Displays: each backend returns outputs as
+#   {"name", "friendly", "primary", "mode": (w, h, hz), "modes": [(w, h, hz)], ...backend data}
+# with exact float refresh rates; the rest of the app works with rounded ints.
 # --------------------------------------------------------------------------
 
-class DISPLAY_DEVICEW(ctypes.Structure):
-    _fields_ = [
-        ("cb", wintypes.DWORD),
-        ("DeviceName", wintypes.WCHAR * 32),
-        ("DeviceString", wintypes.WCHAR * 128),
-        ("StateFlags", wintypes.DWORD),
-        ("DeviceID", wintypes.WCHAR * 128),
-        ("DeviceKey", wintypes.WCHAR * 128),
-    ]
+class Hyprland:
+    def outputs(self):
+        monitors = [m for m in json.loads(_run("hyprctl", "-j", "monitors", "all")) if not m.get("disabled")]
+        # No "primary" in Hyprland: like Windows, call the monitor at 0,0 the main one.
+        first = min(monitors, key=lambda m: (m["x"] != 0 or m["y"] != 0, m["id"]), default={}).get("id")
+        return [{"name": m["name"], "friendly": m.get("model") or "", "primary": m["id"] == first,
+                 "mode": (m["width"], m["height"], m["refreshRate"]),
+                 "modes": [(int(w), int(h), float(hz)) for w, h, hz in
+                           (re.findall(r"(\d+)x(\d+)@([\d.]+)", s)[0] for s in m.get("availableModes", []))],
+                 "raw": m} for m in monitors]
+
+    def set_mode(self, out, mode):
+        m = out["raw"]
+        spec = {"output": m["name"], "mode": f"{mode[0]}x{mode[1]}@{mode[2]:.3f}",
+                "position": f"{m['x']}x{m['y']}", "scale": m["scale"]}
+        # A runtime monitor rule replaces the whole config rule, so carry over what we can see.
+        if m.get("transform"):
+            spec["transform"] = m["transform"]
+        if m.get("vrr"):
+            spec["vrr"] = 1
+        if "2101010" in m.get("currentFormat", ""):
+            spec["bitdepth"] = 10
+        lua = ", ".join(f"{k} = {lua_str(v) if isinstance(v, str) else v}" for k, v in spec.items())
+        legacy = ",".join([spec.pop("output"), spec.pop("mode"), spec.pop("position"), str(spec.pop("scale")),
+                           *(f"{k},{v}" for k, v in spec.items())])
+        hypr(f"hl.monitor({{{lua}}})", ["monitor", legacy])
 
 
-class LUID(ctypes.Structure):
-    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+class KDE:
+    def outputs(self):
+        result = []
+        for o in json.loads(_run("kscreen-doctor", "-j"))["outputs"]:
+            if not (o.get("enabled") and o.get("connected")):
+                continue
+            ids = {(m["size"]["width"], m["size"]["height"], m["refreshRate"]): m["id"] for m in o["modes"]}
+            current = next(mode for mode, mode_id in ids.items() if mode_id == o["currentModeId"])
+            result.append({"name": o["name"], "friendly": o.get("model") or "",
+                           "primary": o.get("priority") == 1 or o.get("primary", False),
+                           "mode": current, "modes": list(ids), "ids": ids})
+        return result
+
+    def set_mode(self, out, mode):
+        _run("kscreen-doctor", f"output.{out['name']}.mode.{out['ids'][mode]}")
 
 
-class DISPLAYCONFIG_PATH_SOURCE_INFO(ctypes.Structure):
-    _fields_ = [("adapterId", LUID), ("id", ctypes.c_uint32), ("modeInfoIdx", ctypes.c_uint32),
-                ("statusFlags", ctypes.c_uint32)]
+class Gnome:
+    """Mutter's DisplayConfig D-Bus API (needs PyGObject, which every GNOME install has)."""
+
+    def _call(self, method, args=None):
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        return bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                             "org.gnome.Mutter.DisplayConfig", method, args, None, 0, -1, None).unpack()
+
+    def outputs(self):
+        _serial, monitors, logical, _props = self._call("GetCurrentState")
+        primary = {spec[0] for lm in logical if lm[4] for spec in lm[5]}
+        result = []
+        for (connector, _vendor, product, _sn), modes, props in monitors:
+            ids = {(m[1], m[2], m[3]): m[0] for m in modes}
+            current = next(((m[1], m[2], m[3]) for m in modes if m[6].get("is-current")), None)
+            if current:
+                result.append({"name": connector, "friendly": props.get("display-name", product),
+                               "primary": connector in primary, "mode": current, "modes": list(ids), "ids": ids})
+        return result
+
+    def set_mode(self, out, mode):
+        from gi.repository import GLib
+        serial, monitors, logical, _props = self._call("GetCurrentState")
+        current = {mon[0][0]: next(m for m in mon[1] if m[6].get("is-current")) for mon in monitors
+                   if any(m[6].get("is-current") for m in mon[1])}
+        target = next(m for m in next(mon for mon in monitors if mon[0][0] == out["name"])[1]
+                      if m[0] == out["ids"][mode])
+        config = []
+        for x, y, scale, transform, is_primary, mons, _ in logical:
+            specs = []
+            for connector, *_ in mons:
+                mode_info = target if connector == out["name"] else current[connector]
+                specs.append((connector, mode_info[0], {}))
+                if connector == out["name"] and not any(abs(scale - s) < 0.01 for s in target[5]):
+                    scale = 1.0  # old scale isn't valid for the new mode
+            config.append((x, y, scale, transform, is_primary, specs))
+        # ponytail: keeps positions as-is; Mutter rejects layouts that leave gaps between monitors,
+        # so changing the left monitor's width in a multi-monitor setup may fail. Re-flow x/y if that bites.
+        self._call("ApplyMonitorsConfig", GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                                                       (serial, 1, config, {})))  # 1 = temporary
 
 
-class DISPLAYCONFIG_PATH_TARGET_INFO(ctypes.Structure):
-    _fields_ = [("adapterId", LUID), ("id", ctypes.c_uint32), ("modeInfoIdx", ctypes.c_uint32),
-                ("outputTechnology", ctypes.c_uint32), ("rotation", ctypes.c_uint32),
-                ("scaling", ctypes.c_uint32), ("refreshNumerator", ctypes.c_uint32),
-                ("refreshDenominator", ctypes.c_uint32), ("scanLineOrdering", ctypes.c_uint32),
-                ("targetAvailable", ctypes.c_int), ("statusFlags", ctypes.c_uint32)]
+class Wlroots:
+    def outputs(self):
+        result = []
+        for i, o in enumerate(o for o in json.loads(_run("wlr-randr", "--json")) if o.get("enabled")):
+            modes = [(m["width"], m["height"], m["refresh"]) for m in o["modes"]]
+            current = next((m["width"], m["height"], m["refresh"]) for m in o["modes"] if m.get("current"))
+            result.append({"name": o["name"], "friendly": o.get("model") or "", "primary": i == 0,
+                           "mode": current, "modes": modes})
+        return result
+
+    def set_mode(self, out, mode):
+        _run("wlr-randr", "--output", out["name"], "--mode", f"{mode[0]}x{mode[1]}@{mode[2]:.3f}Hz")
 
 
-class DISPLAYCONFIG_PATH_INFO(ctypes.Structure):
-    _fields_ = [("sourceInfo", DISPLAYCONFIG_PATH_SOURCE_INFO), ("targetInfo", DISPLAYCONFIG_PATH_TARGET_INFO),
-                ("flags", ctypes.c_uint32)]
+class X11:
+    def outputs(self):
+        result, out = [], None
+        for line in _run("xrandr", "--query").splitlines():
+            head = re.match(r"(\S+) connected (primary )?\d+x\d+\+", line)
+            if head:
+                out = {"name": head[1], "friendly": "", "primary": bool(head[2]), "mode": None, "modes": []}
+                result.append(out)
+            elif not line.startswith(" "):
+                out = None  # disconnected or disabled output
+            elif out and (mode := re.match(r"\s+(\d+)x(\d+)\s+(.*)", line)):
+                for rate, star in re.findall(r"([\d.]+)(\*?)\+?", mode[3]):
+                    m = (int(mode[1]), int(mode[2]), float(rate))
+                    out["modes"].append(m)
+                    if star:
+                        out["mode"] = m
+        if result and not any(o["primary"] for o in result):
+            result[0]["primary"] = True
+        return [o for o in result if o["mode"]]
+
+    def set_mode(self, out, mode):
+        _run("xrandr", "--output", out["name"], "--mode", f"{mode[0]}x{mode[1]}", "--rate", f"{mode[2]:.2f}")
 
 
-class DISPLAYCONFIG_MODE_INFO(ctypes.Structure):
-    _fields_ = [("infoType", ctypes.c_uint32), ("id", ctypes.c_uint32), ("adapterId", LUID),
-                ("data", ctypes.c_byte * 48)]
-
-
-class DISPLAYCONFIG_DEVICE_INFO_HEADER(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_uint32), ("size", ctypes.c_uint32), ("adapterId", LUID),
-                ("id", ctypes.c_uint32)]
-
-
-class DISPLAYCONFIG_SOURCE_DEVICE_NAME(ctypes.Structure):
-    _fields_ = [("header", DISPLAYCONFIG_DEVICE_INFO_HEADER), ("viewGdiDeviceName", wintypes.WCHAR * 32)]
-
-
-class DISPLAYCONFIG_TARGET_DEVICE_NAME(ctypes.Structure):
-    _fields_ = [("header", DISPLAYCONFIG_DEVICE_INFO_HEADER), ("flags", ctypes.c_uint32),
-                ("outputTechnology", ctypes.c_uint32), ("edidManufactureId", ctypes.c_uint16),
-                ("edidProductCodeId", ctypes.c_uint16), ("connectorInstance", ctypes.c_uint32),
-                ("monitorFriendlyDeviceName", wintypes.WCHAR * 64), ("monitorDevicePath", wintypes.WCHAR * 128)]
-
-
-DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1
-DISPLAY_DEVICE_PRIMARY_DEVICE = 0x4
-QDC_ONLY_ACTIVE_PATHS = 0x2
+BACKEND = {"hyprland": Hyprland, "kde": KDE, "gnome": Gnome, "wlroots": Wlroots, "x11": X11}[SESSION]()
 
 
 class Display:
@@ -98,85 +217,27 @@ class Display:
         self.primary = primary
 
     @property
-    def number(self):
-        digits = "".join(ch for ch in self.name if ch.isdigit())
-        return int(digits) if digits else 0
-
-    @property
     def label(self):
-        text = f"Display {self.number}"
+        text = self.name
         if self.friendly:
             text += f"  ·  {self.friendly}"
         return text + ("  (main)" if self.primary else "")
 
 
-class DISPLAYCONFIG_ADVANCED_COLOR_INFO(ctypes.Structure):
-    _fields_ = [("header", DISPLAYCONFIG_DEVICE_INFO_HEADER), ("value", ctypes.c_uint32),
-                ("colorEncoding", ctypes.c_uint32), ("bitsPerColorChannel", ctypes.c_uint32)]
+def _outputs():
+    return sorted(BACKEND.outputs(), key=lambda o: not o["primary"])
 
 
-def _active_paths():
-    """(GDI device name, path) for every active display path."""
-    try:
-        n_paths, n_modes = ctypes.c_uint32(), ctypes.c_uint32()
-        if user32.GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, ctypes.byref(n_paths), ctypes.byref(n_modes)):
-            return []
-        paths = (DISPLAYCONFIG_PATH_INFO * n_paths.value)()
-        modes = (DISPLAYCONFIG_MODE_INFO * n_modes.value)()
-        if user32.QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ctypes.byref(n_paths), paths,
-                                     ctypes.byref(n_modes), modes, None):
-            return []
-        result = []
-        for path in paths[:n_paths.value]:
-            source = DISPLAYCONFIG_SOURCE_DEVICE_NAME()
-            source.header.type, source.header.size = 1, ctypes.sizeof(source)
-            source.header.adapterId, source.header.id = path.sourceInfo.adapterId, path.sourceInfo.id
-            if user32.DisplayConfigGetDeviceInfo(ctypes.byref(source)) == 0:
-                result.append((source.viewGdiDeviceName, path))
-        return result
-    except (OSError, AttributeError):
-        return []
-
-
-def _target_info(path, struct, info_type):
-    info = struct()
-    info.header.type, info.header.size = info_type, ctypes.sizeof(info)
-    info.header.adapterId, info.header.id = path.targetInfo.adapterId, path.targetInfo.id
-    return info if user32.DisplayConfigGetDeviceInfo(ctypes.byref(info)) == 0 else None
-
-
-def _monitor_names():
-    """GDI device name -> monitor model name (e.g. '\\\\.\\DISPLAY1' -> 'VG259QM')."""
-    names = {}
-    for gdi_name, path in _active_paths():
-        target = _target_info(path, DISPLAYCONFIG_TARGET_DEVICE_NAME, 2)
-        if target:
-            names[gdi_name] = target.monitorFriendlyDeviceName
-    return names
-
-
-def advanced_color_enabled(display):
-    """True when Windows HDR / Auto Color Management is on, which blocks gamma-ramp adjustments."""
-    for gdi_name, path in _active_paths():
-        if gdi_name == display:
-            info = _target_info(path, DISPLAYCONFIG_ADVANCED_COLOR_INFO, 9)
-            return bool(info and info.value & 0x2)
-    return False
+def _output(display):
+    out = next((o for o in _outputs() if o["name"] == display), None)
+    if not out:
+        raise RuntimeError(f"Display {display} isn't connected")
+    return out
 
 
 def list_displays():
     """Displays attached to the desktop, main display first."""
-    names = _monitor_names()
-    displays = []
-    dev = DISPLAY_DEVICEW(cb=ctypes.sizeof(DISPLAY_DEVICEW))
-    i = 0
-    while user32.EnumDisplayDevicesW(None, i, ctypes.byref(dev), 0):
-        if dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
-            displays.append(Display(dev.DeviceName, names.get(dev.DeviceName, ""),
-                                    bool(dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)))
-        i += 1
-    displays.sort(key=lambda d: (not d.primary, d.number))
-    return displays
+    return [Display(o["name"], o["friendly"], o["primary"]) for o in _outputs()]
 
 
 def primary_display_name():
@@ -196,292 +257,188 @@ def resolve_display(name):
     return displays[0].name
 
 
-# --------------------------------------------------------------------------
-# Resolution (Win32 ChangeDisplaySettingsEx)
-# --------------------------------------------------------------------------
-
-class DEVMODEW(ctypes.Structure):
-    _fields_ = [
-        ("dmDeviceName", wintypes.WCHAR * 32),
-        ("dmSpecVersion", wintypes.WORD),
-        ("dmDriverVersion", wintypes.WORD),
-        ("dmSize", wintypes.WORD),
-        ("dmDriverExtra", wintypes.WORD),
-        ("dmFields", wintypes.DWORD),
-        ("dmPositionX", wintypes.LONG),
-        ("dmPositionY", wintypes.LONG),
-        ("dmDisplayOrientation", wintypes.DWORD),
-        ("dmDisplayFixedOutput", wintypes.DWORD),
-        ("dmColor", ctypes.c_short),
-        ("dmDuplex", ctypes.c_short),
-        ("dmYResolution", ctypes.c_short),
-        ("dmTTOption", ctypes.c_short),
-        ("dmCollate", ctypes.c_short),
-        ("dmFormName", wintypes.WCHAR * 32),
-        ("dmLogPixels", wintypes.WORD),
-        ("dmBitsPerPel", wintypes.DWORD),
-        ("dmPelsWidth", wintypes.DWORD),
-        ("dmPelsHeight", wintypes.DWORD),
-        ("dmDisplayFlags", wintypes.DWORD),
-        ("dmDisplayFrequency", wintypes.DWORD),
-        ("dmICMMethod", wintypes.DWORD),
-        ("dmICMIntent", wintypes.DWORD),
-        ("dmMediaType", wintypes.DWORD),
-        ("dmDitherType", wintypes.DWORD),
-        ("dmReserved1", wintypes.DWORD),
-        ("dmReserved2", wintypes.DWORD),
-        ("dmPanningWidth", wintypes.DWORD),
-        ("dmPanningHeight", wintypes.DWORD),
-    ]
-
-
-ENUM_CURRENT_SETTINGS = -1
-DM_PELSWIDTH = 0x80000
-DM_PELSHEIGHT = 0x100000
-DM_DISPLAYFREQUENCY = 0x400000
-CDS_TEST = 0x2
-DISP_CHANGE_MESSAGES = {
-    0: "success",
-    1: "restart required",
-    -1: "display driver failed the mode",
-    -2: "mode not supported",
-    -3: "unable to write settings to registry",
-    -4: "invalid flags",
-    -5: "invalid parameter",
-}
-
-user32.EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
-user32.ChangeDisplaySettingsExW.argtypes = [
-    wintypes.LPCWSTR, ctypes.POINTER(DEVMODEW), wintypes.HWND, wintypes.DWORD, wintypes.LPVOID,
-]
-user32.ChangeDisplaySettingsExW.restype = wintypes.LONG
-
-
 def get_mode(display):
-    dm = DEVMODEW(dmSize=ctypes.sizeof(DEVMODEW))
-    if not user32.EnumDisplaySettingsW(display, ENUM_CURRENT_SETTINGS, ctypes.byref(dm)):
-        raise RuntimeError(f"Could not read display settings for {display}")
-    return dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency
+    w, h, hz = _output(display)["mode"]
+    return w, h, round(hz)
+
+
+def current_modes():
+    """{display: (w, h, hz)} for every connected display, in one backend call."""
+    return {o["name"]: (o["mode"][0], o["mode"][1], round(o["mode"][2])) for o in _outputs()}
 
 
 def list_modes(display):
-    modes = set()
-    dm = DEVMODEW(dmSize=ctypes.sizeof(DEVMODEW))
-    i = 0
-    while user32.EnumDisplaySettingsW(display, i, ctypes.byref(dm)):
-        modes.add((dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency))
-        i += 1
-    return sorted(modes, reverse=True)
+    return sorted({(w, h, round(hz)) for w, h, hz in _output(display)["modes"]}, reverse=True)
 
 
-def set_mode(display, width, height, refresh=None, test_only=False):
-    dm = DEVMODEW(dmSize=ctypes.sizeof(DEVMODEW))
-    dm.dmPelsWidth = width
-    dm.dmPelsHeight = height
-    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
-    if refresh:
-        dm.dmDisplayFrequency = refresh
-        dm.dmFields |= DM_DISPLAYFREQUENCY
-    # Flags 0 = change dynamically without saving to the registry, so a reboot
-    # always brings back your normal Windows resolution.
-    flags = CDS_TEST if test_only else 0
-    result = user32.ChangeDisplaySettingsExW(display, ctypes.byref(dm), None, flags, None)
-    if result != 0:
-        msg = DISP_CHANGE_MESSAGES.get(result, f"error {result}")
-        raise RuntimeError(f"Could not set {width}x{height}@{refresh or 'any'}Hz: {msg}")
+def set_mode(display, width, height, refresh=None):
+    out = _output(display)
+    matches = [m for m in out["modes"] if m[:2] == (width, height) and (not refresh or round(m[2]) == refresh)]
+    if not matches:
+        raise RuntimeError(f"Could not set {width}x{height}@{refresh or 'any'}Hz: mode not supported")
+    BACKEND.set_mode(out, max(matches, key=lambda m: m[2]))
 
 
 # --------------------------------------------------------------------------
-# Digital vibrance: NVIDIA NvAPI
+# Digital vibrance backends
 # --------------------------------------------------------------------------
 
-class NV_DISPLAY_DVC_INFO(ctypes.Structure):
-    _fields_ = [
-        ("version", ctypes.c_uint32),
-        ("currentLevel", ctypes.c_int32),
-        ("minLevel", ctypes.c_int32),
-        ("maxLevel", ctypes.c_int32),
-    ]
+def _nvidia_connectors():
+    """Connected DRM connectors on NVIDIA cards, e.g. ['DP-3', 'HDMI-A-1']."""
+    names = []
+    for card in Path("/sys/class/drm").glob("card[0-9]"):
+        try:
+            if (card / "device" / "vendor").read_text().strip() != "0x10de":
+                continue
+        except OSError:
+            continue
+        for conn in Path("/sys/class/drm").glob(f"{card.name}-*"):
+            try:
+                if (conn / "status").read_text().strip() == "connected":
+                    names.append(conn.name.split("-", 1)[1])
+            except OSError:
+                continue
+    return sorted(names, key=lambda n: (n.rsplit("-", 1)[0], int(n.rsplit("-", 1)[1])))
 
 
-class NvAPI:
+class Nvibrant:
+    """Real NVIDIA Digital Vibrance on Wayland and X11 via https://github.com/Tremeschin/nvibrant.
+
+    nvibrant takes one value per NVIDIA driver port and can't read values back, so we remember them.
+    """
+
     NAME = "NVIDIA"
-    _IDS = {
-        "Initialize": 0x0150E828,
-        "GetAssociatedNvidiaDisplayHandle": 0x35C29134,
-        "GetDVCInfo": 0x4085DE45,
-        "SetDVCLevel": 0x172409B4,
-    }
+    TYPES = {"HDMI": "HDMI-A", "DP": "DP", "DVID": "DVI-D", "DVII": "DVI-I", "USBC": "DP"}
 
     def __init__(self):
-        try:
-            dll = ctypes.CDLL("nvapi64.dll")
-        except OSError as e:
-            raise RuntimeError("nvapi64.dll not found (no NVIDIA driver)") from e
-        query = dll.nvapi_QueryInterface
-        query.restype = ctypes.c_void_p
-        query.argtypes = [ctypes.c_uint32]
+        if not shutil.which("nvibrant"):
+            raise RuntimeError("nvibrant not installed")
+        # Probing sets every port, so this also resets vibrance to the driver default.
+        lines = re.findall(r"\((\d+),\s*(\w+)\s*\).*•\s*(\w+)\s*$", _run("nvibrant"), re.M)
+        self.ports = len(lines)
+        # ponytail: driver port order != DRM connector numbers, so pair the connected ports of each type
+        # with the connected NVIDIA connectors of that type in order. Wrong only with 2+ same-type monitors
+        # wired out of order; an override map in config would fix that if anyone hits it.
+        connected = _nvidia_connectors()
+        self.port_of = {}
+        for kind in set(self.TYPES.values()):
+            ports = [int(p) for p, t, status in lines if self.TYPES.get(t) == kind and status == "Success"]
+            names = [n for n in connected if n.rsplit("-", 1)[0] == kind]
+            self.port_of.update(zip(names, ports))
+        if not self.port_of:
+            raise RuntimeError("no NVIDIA-driven display found")
+        self.levels = [0] * self.ports
 
-        def fn(name, *argtypes):
-            ptr = query(self._IDS[name])
-            if not ptr:
-                raise RuntimeError(f"NvAPI function {name} not available")
-            return ctypes.CFUNCTYPE(ctypes.c_int, *argtypes)(ptr)
+    def owns(self, display):
+        return display in self.port_of
 
-        self._initialize = fn("Initialize")
-        self._get_handle = fn("GetAssociatedNvidiaDisplayHandle", ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p))
-        self._get_dvc = fn("GetDVCInfo", ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(NV_DISPLAY_DVC_INFO))
-        self._set_dvc = fn("SetDVCLevel", ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int32)
-        self._check(self._initialize(), "Initialize")
+    # The NVIDIA Control Panel shows vibrance as 50%-100%; the driver level runs 0 (default) to 1023 (max).
+    def get_vibrance_percent(self, display):
+        return round(50 + self.levels[self.port_of[display]] * 50 / 1023)
 
-    @staticmethod
-    def _check(status, what):
-        if status != 0:
-            raise RuntimeError(f"NvAPI {what} failed (status {status})")
+    def set_vibrance_percent(self, display, percent):
+        self.levels[self.port_of[display]] = round((max(50, min(100, percent)) - 50) * 1023 / 50)
+        _run("nvibrant", *map(str, self.levels))
 
-    def _handle(self, display):
-        handle = ctypes.c_void_p()
-        self._check(self._get_handle(display.encode("ascii"), ctypes.byref(handle)),
-                    f"GetAssociatedNvidiaDisplayHandle({display})")
-        return handle
+
+class NvidiaSettings:
+    """Digital Vibrance through nvidia-settings (X11 only)."""
+
+    NAME = "NVIDIA"
+
+    def __init__(self):
+        if SESSION != "x11" or not shutil.which("nvidia-settings"):
+            raise RuntimeError("nvidia-settings needs an X11 session")
 
     def owns(self, display):
         try:
-            self._handle(display)
+            self.get_vibrance_percent(display)
             return True
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             return False
 
-    def get_dvc(self, display):
-        info = NV_DISPLAY_DVC_INFO(version=ctypes.sizeof(NV_DISPLAY_DVC_INFO) | (1 << 16))
-        self._check(self._get_dvc(self._handle(display), 0, ctypes.byref(info)), "GetDVCInfo")
-        return info.currentLevel, info.minLevel, info.maxLevel
-
-    # The NVIDIA Control Panel shows vibrance as 50%-100%, which maps to DVC level 0-63.
     def get_vibrance_percent(self, display):
-        level, lo, hi = self.get_dvc(display)
-        return round(50 + (level - lo) * 50 / (hi - lo))
+        level = int(_run("nvidia-settings", "-t", "-q", f"[DPY:{display}]/DigitalVibrance").strip())
+        return round(50 + max(0, level) * 50 / 1023)
 
     def set_vibrance_percent(self, display, percent):
-        _, lo, hi = self.get_dvc(display)
-        percent = max(50, min(100, percent))
-        self._check(self._set_dvc(self._handle(display), 0, round(lo + (percent - 50) * (hi - lo) / 50)),
-                    "SetDVCLevel")
+        level = round((max(50, min(100, percent)) - 50) * 1023 / 50)
+        _run("nvidia-settings", "-a", f"[DPY:{display}]/DigitalVibrance={level}")
 
 
-# --------------------------------------------------------------------------
-# Digital vibrance: AMD ADL (Radeon "Saturation")
-# --------------------------------------------------------------------------
+SHADER = """#version 300 es
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+out vec4 fragColor;
 
-class ADLAdapterInfo(ctypes.Structure):
-    _fields_ = [
-        ("iSize", ctypes.c_int), ("iAdapterIndex", ctypes.c_int), ("strUDID", ctypes.c_char * 256),
-        ("iBusNumber", ctypes.c_int), ("iDeviceNumber", ctypes.c_int), ("iFunctionNumber", ctypes.c_int),
-        ("iVendorID", ctypes.c_int), ("strAdapterName", ctypes.c_char * 256),
-        ("strDisplayName", ctypes.c_char * 256), ("iPresent", ctypes.c_int), ("iExist", ctypes.c_int),
-        ("strDriverPath", ctypes.c_char * 256), ("strDriverPathExt", ctypes.c_char * 256),
-        ("strPNPString", ctypes.c_char * 256), ("iOSDisplayIndex", ctypes.c_int),
-    ]
-
-
-class ADLDisplayID(ctypes.Structure):
-    _fields_ = [("iDisplayLogicalIndex", ctypes.c_int), ("iDisplayPhysicalIndex", ctypes.c_int),
-                ("iDisplayLogicalAdapterIndex", ctypes.c_int), ("iDisplayPhysicalAdapterIndex", ctypes.c_int)]
+void main() {{
+    vec4 c = texture(tex, v_texcoord);
+    vec3 v = mix(vec3(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722))), c.rgb, {saturation:.4f});
+    v = pow(clamp(v, 0.0, 1.0), vec3({inv_gamma:.4f}));
+    v = (v - 0.5) * {contrast:.4f} + 0.5 + {brightness:.4f};
+    fragColor = vec4(clamp(v, 0.0, 1.0), c.a);
+}}
+"""
 
 
-class ADLDisplayInfo(ctypes.Structure):
-    _fields_ = [
-        ("displayID", ADLDisplayID), ("iDisplayControllerIndex", ctypes.c_int),
-        ("strDisplayName", ctypes.c_char * 256), ("strDisplayManufacturerName", ctypes.c_char * 256),
-        ("iDisplayType", ctypes.c_int), ("iDisplayOutputType", ctypes.c_int), ("iDisplayConnector", ctypes.c_int),
-        ("iDisplayInfoMask", ctypes.c_int), ("iDisplayInfoValue", ctypes.c_int),
-    ]
+class HyprShader:
+    """Saturation + brightness/contrast/gamma as a Hyprland screen shader. Works on any GPU.
 
+    ponytail: Hyprland's screen shader is global, so the last applied values cover every monitor.
+    """
 
-ADL_DISPLAY_COLOR_SATURATION = 1 << 2
-ADL_DISPLAY_CONNECTED_AND_MAPPED = 0x3
-_malloc = ctypes.cdll.msvcrt.malloc
-_malloc.restype = ctypes.c_void_p
-_malloc.argtypes = [ctypes.c_size_t]
-ADL_MALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(lambda size: _malloc(size))
-
-
-class AmdADL:
-    """Maps vibrance 50-100% onto Radeon saturation default..max (usually 100..200)."""
-
-    NAME = "AMD"
+    NAME = "Hyprland shader"
+    MAX_SATURATION = 2.0  # what 100% vibrance means; NVIDIA's max is roughly 2x. Calibration knob.
 
     def __init__(self):
-        try:
-            self.dll = ctypes.CDLL("atiadlxx.dll")
-        except OSError as e:
-            raise RuntimeError("atiadlxx.dll not found (no AMD driver)") from e
-        self.ctx = ctypes.c_void_p()
-        if self.dll.ADL2_Main_Control_Create(ADL_MALLOC, 1, ctypes.byref(self.ctx)) != 0:
-            raise RuntimeError("ADL initialisation failed")
-        count = ctypes.c_int()
-        self.dll.ADL2_Adapter_NumberOfAdapters_Get(self.ctx, ctypes.byref(count))
-        self.adapters = {}
-        if count.value > 0:
-            infos = (ADLAdapterInfo * count.value)()
-            for info in infos:
-                info.iSize = ctypes.sizeof(ADLAdapterInfo)
-            if self.dll.ADL2_Adapter_AdapterInfo_Get(self.ctx, infos, ctypes.sizeof(infos)) == 0:
-                for info in infos:
-                    name = info.strDisplayName.decode(errors="ignore")
-                    if info.iPresent and name:
-                        self.adapters.setdefault(name, info.iAdapterIndex)
-
-    def _target(self, display):
-        adapter = self.adapters.get(display)
-        if adapter is None:
-            return None
-        count = ctypes.c_int()
-        info = ctypes.POINTER(ADLDisplayInfo)()
-        if self.dll.ADL2_Display_DisplayInfo_Get(self.ctx, adapter, ctypes.byref(count), ctypes.byref(info), 0):
-            return None
-        for i in range(count.value):
-            d = info[i]
-            if (d.iDisplayInfoValue & ADL_DISPLAY_CONNECTED_AND_MAPPED) == ADL_DISPLAY_CONNECTED_AND_MAPPED \
-                    and d.displayID.iDisplayLogicalAdapterIndex == adapter:
-                return adapter, d.displayID.iDisplayLogicalIndex
-        return None
+        if SESSION != "hyprland":
+            raise RuntimeError("needs Hyprland")
+        self.vibrance = 50
+        self.adjustment = None  # (brightness, contrast, gamma) or None
+        self._flip = False
 
     def owns(self, display):
-        return self._target(display) is not None
-
-    def _saturation(self, display):
-        target = self._target(display)
-        if not target:
-            raise RuntimeError(f"No AMD display for {display}")
-        cur, default, lo, hi, step = (ctypes.c_int() for _ in range(5))
-        if self.dll.ADL2_Display_Color_Get(self.ctx, *target, ADL_DISPLAY_COLOR_SATURATION, ctypes.byref(cur),
-                                           ctypes.byref(default), ctypes.byref(lo), ctypes.byref(hi),
-                                           ctypes.byref(step)):
-            raise RuntimeError("ADL could not read saturation")
-        return target, cur.value, default.value, hi.value
+        return True
 
     def get_vibrance_percent(self, display):
-        _, cur, default, hi = self._saturation(display)
-        return round(50 + max(0, cur - default) * 50 / max(1, hi - default))
+        return self.vibrance
 
     def set_vibrance_percent(self, display, percent):
-        target, _, default, hi = self._saturation(display)
-        value = round(default + (max(50, min(100, percent)) - 50) * (hi - default) / 50)
-        if self.dll.ADL2_Display_Color_Set(self.ctx, *target, ADL_DISPLAY_COLOR_SATURATION, value):
-            raise RuntimeError("ADL could not set saturation")
+        self.vibrance = max(50, min(100, percent))
+        self._apply()
+
+    def set_adjustment(self, brightness, contrast, gamma):
+        self.adjustment = (brightness, contrast, gamma)
+        self._apply()
+
+    def reset_adjustment(self):
+        self.adjustment = None
+        self._apply()
+
+    @staticmethod
+    def _set_shader(path):
+        hypr(f"hl.config({{decoration = {{screen_shader = {lua_str(path)}}}}})",
+             ["decoration:screen_shader", path or "[[EMPTY]]"])
+
+    def _apply(self):
+        brightness, contrast, gamma = self.adjustment or (50, 50, 1.0)
+        if self.vibrance == 50 and not self.adjustment:
+            self._set_shader("")  # off = direct scanout stays possible
+            return
+        # Hyprland only reloads the shader when the path changes, so alternate between two files.
+        self._flip = not self._flip
+        path = DATA_DIR / f"screen-{'ab'[self._flip]}.frag"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(SHADER.format(saturation=1 + (self.vibrance - 50) / 50 * (self.MAX_SATURATION - 1),
+                                      inv_gamma=1 / gamma, contrast=contrast / 50,
+                                      brightness=(brightness - 50) / 100))
+        self._set_shader(str(path))
 
 
 # --------------------------------------------------------------------------
-# Colour engine: vibrance backends + gamma ramp (brightness / contrast / gamma)
+# Colour engine: vibrance backends + brightness / contrast / gamma
 # --------------------------------------------------------------------------
-
-GammaRamp = wintypes.WORD * 768
-gdi32.CreateDCW.restype = wintypes.HDC
-gdi32.CreateDCW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p]
-gdi32.DeleteDC.argtypes = [wintypes.HDC]
-gdi32.GetDeviceGammaRamp.argtypes = [wintypes.HDC, ctypes.c_void_p]
-gdi32.SetDeviceGammaRamp.argtypes = [wintypes.HDC, ctypes.c_void_p]
 
 NEUTRAL_COLOR = {"brightness": 50, "contrast": 50, "gamma": 1.0}
 
@@ -490,29 +447,17 @@ def color_adjusted(profile):
     return any(abs(profile.get(k, v) - v) > 1e-6 for k, v in NEUTRAL_COLOR.items())
 
 
-def build_ramp(brightness, contrast, gamma):
-    """Brightness/contrast 0-100 (50 = unchanged), gamma 0.5-2.5 (1.0 = unchanged)."""
-    ramp = GammaRamp()
-    c, b = contrast / 50, (brightness - 50) / 100
-    for i in range(256):
-        v = (i / 255) ** (1 / gamma)
-        v = (v - 0.5) * c + 0.5 + b
-        ramp[i] = ramp[256 + i] = ramp[512 + i] = int(min(max(v, 0.0), 1.0) * 65535)
-    return ramp
-
-
 class Color:
     def __init__(self):
         self.backends = []
         self.errors = []
-        for backend in (NvAPI, AmdADL):
+        for backend in (Nvibrant, NvidiaSettings, HyprShader):
             try:
                 self.backends.append(backend())
-            except Exception as e:  # missing driver, unexpected DLL version, ...
+            except Exception as e:  # missing tool, wrong session, unexpected output...
                 self.errors.append(f"{backend.NAME}: {e}")
+        self.shader = next((b for b in self.backends if isinstance(b, HyprShader)), None)
         self._owners = {}
-        self._original_ramps = {}
-        self._ramp_support = {}
 
     def _backend(self, display):
         if display not in self._owners:
@@ -535,112 +480,53 @@ class Color:
         if backend:
             backend.set_vibrance_percent(display, percent)
 
-    def _dc(self, display):
-        hdc = gdi32.CreateDCW(display, None, None, None)
-        if not hdc:
-            raise RuntimeError(f"Could not open {display} for colour adjustment")
-        return hdc
+    @staticmethod
+    def vibrance_hint():
+        return ("Digital vibrance needs Hyprland (any GPU), or an NVIDIA card with nvibrant installed, "
+                "or nvidia-settings on X11.")
 
     def supports_adjustment(self, display):
-        """Whether Windows lets us change this display's gamma ramp (it doesn't under HDR/Advanced Color)."""
-        if display not in self._ramp_support:
-            try:
-                hdc = self._dc(display)
-                try:
-                    self._ramp_support[display] = bool(gdi32.GetDeviceGammaRamp(hdc, GammaRamp()))
-                finally:
-                    gdi32.DeleteDC(hdc)
-            except RuntimeError:
-                self._ramp_support[display] = False
-        return self._ramp_support[display]
+        return self.shader is not None
 
     def adjustment_unavailable_reason(self, display):
         if self.supports_adjustment(display):
             return None
-        if advanced_color_enabled(display):
-            return ("Unavailable on this display: Windows blocks brightness/contrast/gamma changes while "
-                    "HDR or Auto Color Management is on (Settings > System > Display).")
-        return "Unavailable on this display: Windows doesn't allow gamma changes for it."
+        return "Unavailable on this desktop: brightness/contrast/gamma need Hyprland."
 
     def set_adjustment(self, display, brightness, contrast, gamma):
-        hdc = self._dc(display)
-        try:
-            if display not in self._original_ramps:
-                original = GammaRamp()
-                if gdi32.GetDeviceGammaRamp(hdc, original):
-                    self._original_ramps[display] = original
-            if not gdi32.SetDeviceGammaRamp(hdc, build_ramp(brightness, contrast, gamma)):
-                raise RuntimeError("Windows rejected these brightness/contrast/gamma values - "
-                                   "try values closer to the defaults")
-        finally:
-            gdi32.DeleteDC(hdc)
+        self.shader.set_adjustment(brightness, contrast, gamma)
 
     def reset_adjustment(self, display):
-        original = self._original_ramps.pop(display, None)
-        if original is None:
-            return
-        hdc = self._dc(display)
-        try:
-            gdi32.SetDeviceGammaRamp(hdc, original)
-        finally:
-            gdi32.DeleteDC(hdc)
+        if self.shader and self.shader.adjustment:
+            self.shader.reset_adjustment()
 
     def reset_all_adjustments(self):
-        for display in list(self._original_ramps):
-            try:
-                self.reset_adjustment(display)
-            except RuntimeError:
-                pass
+        try:
+            self.reset_adjustment(None)
+        except RuntimeError:
+            pass
 
 
 # --------------------------------------------------------------------------
 # Processes
 # --------------------------------------------------------------------------
 
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", wintypes.DWORD),
-        ("cntUsage", wintypes.DWORD),
-        ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_size_t),
-        ("th32ModuleID", wintypes.DWORD),
-        ("cntThreads", wintypes.DWORD),
-        ("th32ParentProcessID", wintypes.DWORD),
-        ("pcPriClassBase", wintypes.LONG),
-        ("dwFlags", wintypes.DWORD),
-        ("szExeFile", wintypes.WCHAR * 260),
-    ]
-
-
-TH32CS_SNAPPROCESS = 0x2
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
-                                                ctypes.POINTER(wintypes.DWORD)]
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+def process_name(pid):
+    """Lowercase executable name: 'cs2' for native games, 'overwatch.exe' for Proton/Wine games."""
+    try:
+        argv0 = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0", 1)[0].decode(errors="ignore")
+        name = re.split(r"[\\/]", argv0)[-1]
+        return (name or Path(f"/proc/{pid}/comm").read_text().strip()).lower()
+    except OSError:
+        return None
 
 
 def running_processes():
     """Map of pid -> lowercase exe name for every running process."""
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == INVALID_HANDLE_VALUE:
-        return {}
     procs = {}
-    try:
-        entry = PROCESSENTRY32W(dwSize=ctypes.sizeof(PROCESSENTRY32W))
-        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            procs[entry.th32ProcessID] = entry.szExeFile.lower()
-            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
-    finally:
-        kernel32.CloseHandle(snap)
+    for entry in os.listdir("/proc"):
+        if entry.isdigit() and (name := process_name(entry)):
+            procs[int(entry)] = name
     return procs
 
 
@@ -648,28 +534,42 @@ def running_exes():
     return set(running_processes().values())
 
 
-def process_name(pid):
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return None
+def _x11_window_pid(window):
+    out = _run("xprop", "-id", window, "_NET_WM_PID")
+    return int(out.split("=")[1]) if "=" in out else None
+
+
+def window_pids():
+    """Pids of apps with an open window, where the desktop lets us see them (else empty)."""
     try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(1024)
-        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            return Path(buf.value).name.lower()
-        return None
-    finally:
-        kernel32.CloseHandle(handle)
+        if SESSION == "hyprland":
+            return {c["pid"] for c in json.loads(_run("hyprctl", "-j", "clients")) if c.get("mapped")}
+        if SESSION == "x11" and shutil.which("xprop"):
+            ids = re.findall(r"0x[0-9a-f]+", _run("xprop", "-root", "_NET_CLIENT_LIST"))
+            return {pid for w in ids if (pid := _x11_window_pid(w))}
+    except (RuntimeError, ValueError):
+        pass
+    return set()
+
+
+FOCUS_SUPPORTED = SESSION == "hyprland" or (SESSION == "x11" and bool(shutil.which("xprop")))
 
 
 def foreground_exe():
-    """Lowercase exe name of the app that owns the focused window."""
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
+    """Lowercase exe name of the focused app, or None when the desktop doesn't tell us."""
+    # ponytail: KDE/GNOME Wayland need a KWin script / shell extension to expose the focused window;
+    # without it alt-tab detection is off there and the game profile simply stays on.
+    try:
+        if SESSION == "hyprland":
+            pid = json.loads(_run("hyprctl", "-j", "activewindow")).get("pid")
+        elif SESSION == "x11" and shutil.which("xprop"):
+            window = re.search(r"0x[0-9a-f]+", _run("xprop", "-root", "_NET_ACTIVE_WINDOW"))
+            pid = window and _x11_window_pid(window[0])
+        else:
+            return None
+    except (RuntimeError, ValueError):
         return None
-    pid = wintypes.DWORD()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return process_name(pid.value) or running_processes().get(pid.value)
+    return process_name(pid) if pid else None
 
 
 # --------------------------------------------------------------------------
@@ -693,10 +593,6 @@ def default_config():
 
 
 def migrate(config):
-    if "version" not in config:
-        config["setup_complete"] = True  # existing users skip the first-run wizard
-    if "width" in config.get("desktop", {}):  # v1 stored one desktop profile for the main display
-        config["desktop"] = {primary_display_name(): config["desktop"]}
     for key, value in DEFAULT_SETTINGS.items():
         config.setdefault(key, value)
     config.setdefault("setup_complete", True)
@@ -865,7 +761,7 @@ class Watcher:
         self.wake.set()
 
     def poke(self):
-        """Re-check right away (called when the foreground window changes)."""
+        """Re-check right away (called when the focused window changes)."""
         self.wake.set()
 
     def _safe(self, fn, *args):
@@ -877,7 +773,7 @@ class Watcher:
             return False
 
     def _restore_desktop(self, display):
-        label = "Desktop" if len(self.config["desktop"]) < 2 else f"Desktop ({display.strip(chr(92) + '.')})"
+        label = "Desktop" if len(self.config["desktop"]) < 2 else f"Desktop ({display})"
         apply_profile(desktop_profile(self.config, display), display, self.color, label, self.log)
         clear_game_state(display)
 
@@ -908,7 +804,8 @@ class Watcher:
         profile = self.config["games"].get(exe)
         if profile is None:
             return
-        focused = foreground_exe() == exe if profile.get("alt_tab", True) else True
+        foreground = foreground_exe() if profile.get("alt_tab", True) else None
+        focused = foreground is None or foreground == exe  # unknown focus counts as in-game
         if focused == self.focused:
             return
         self.focused = focused
@@ -969,11 +866,14 @@ def main():
         return
     color = Color()
     if cmd == "status":
+        print(f"Session: {SESSION}")
         for d in list_displays():
             w, h, hz = get_mode(d.name)
             vib = color.get_vibrance(d.name)
-            print(f"{d.label}\n  {d.name}: {w}x{h} @ {hz}Hz, vibrance "
+            print(f"{d.label}\n  {w}x{h} @ {hz}Hz, vibrance "
                   f"{f'{vib}% ({color.vendor(d.name)})' if vib is not None else 'not supported'}")
+        for error in color.errors:
+            print(f"  ({error})")
         return
     config = load_config()
     if cmd == "run":
