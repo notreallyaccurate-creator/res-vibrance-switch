@@ -1,6 +1,6 @@
 """Res & Vibrance Switch - GTK4 app: sidebar window, tray helper process, global hotkeys.
 
-Design rules live in CLAUDE.md. All colours come from PALETTES via the CSS template below.
+All colours come from PALETTES via the CSS template below.
 """
 
 import base64
